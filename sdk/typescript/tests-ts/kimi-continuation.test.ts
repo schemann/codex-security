@@ -173,7 +173,14 @@ function clientWithThread(
       credentialsAvailable: true,
     }),
     resolvePluginPython: async () => "/managed/python",
-    prepareOutputDir: async () => join(root, "scan"),
+    prepareOutputDir: async () => {
+      // The real prepareOutputDir creates the scan directory privately
+      // (mode 0700); since v0.1.5 requireScanRoot enforces that invariant
+      // at read time, the double must create it the same way.
+      const scanDir = join(root, "scan");
+      await mkdir(scanDir, { recursive: true, mode: 0o700 });
+      return scanDir;
+    },
     repositoryRevision: async () => "deadbeef",
     runWorkbench: workbenchMock(commands, workbenchOverrides),
     createCodex: () => ({ startThread: () => thread.thread }),
@@ -233,11 +240,17 @@ describe("Kimi scan continuation", () => {
     const warnings: string[] = [];
     const client = clientWithThread(root, codexHome, thread, commands);
 
-    await expect(
-      client.run(repository, {
+    const failure: unknown = await client
+      .run(repository, {
         onWarning: (warning) => warnings.push(warning),
-      }),
-    ).rejects.toBeInstanceOf(IncompleteScanError);
+      })
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(IncompleteScanError);
+    // The v0.1.5 "without required artifacts" message variant (including the
+    // workbench-generated report.md) is the retryable artifact class.
+    expect((failure as Error).message).toContain(
+      "completed without required artifacts: scan-manifest.json, findings.json, coverage.json, report.md",
+    );
     // 1 initial run + 3 continuations.
     expect(thread.prompts.length).toBe(4);
     expect(warnings.length).toBe(3);
