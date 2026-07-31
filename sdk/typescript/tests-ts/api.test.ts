@@ -633,9 +633,19 @@ describe("CodexSecurity orchestration", () => {
       { codexOverrides: { model: "unknown-model" } },
       { environment: {} },
     );
+    const warnings: string[] = [];
     await expect(
-      unpriced.preflight(repository, { maxCostUsd: 5 }),
-    ).rejects.toThrow("cost limit is not available for the configured model");
+      unpriced.preflight(repository, {
+        maxCostUsd: 5,
+        onWarning: (warning) => warnings.push(warning),
+      }),
+    ).resolves.toMatchObject({ model: "unknown-model", maxCostUsd: 5 });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(
+      warnings.some((warning) =>
+        warning.includes("Cost estimate unavailable for this model"),
+      ),
+    ).toBe(true);
     expect(runtimeStarted).toBe(false);
     await unpriced.close();
     await client.close();

@@ -1,0 +1,16 @@
+data: {"id":"chatcmpl-test1","object":"chat.completion.chunk","created":1785427990,"model":"k3-256k","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"The user wants"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-test1","object":"chat.completion.chunk","created":1785427990,"model":"k3-256k","choices":[{"index":0,"delta":{"reasoning_content":" me to run a command."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-test1","object":"chat.completion.chunk","created":1785427991,"model":"k3-256k","choices":[{"index":0,"delta":{"content":"I'll run that for you."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-test1","object":"chat.completion.chunk","created":1785427992,"model":"k3-256k","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_abc123","type":"function","function":{"name":"exec_command","arguments":"{\"cmd\":"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-test1","object":"chat.completion.chunk","created":1785427992,"model":"k3-256k","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"echo hi\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-test1","object":"chat.completion.chunk","created":1785427993,"model":"k3-256k","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"id":"chatcmpl-test1","object":"chat.completion.chunk","created":1785427993,"model":"k3-256k","choices":[],"usage":{"prompt_tokens":120,"completion_tokens":35,"total_tokens":155,"completion_tokens_details":{"reasoning_tokens":12}}}
+
+data: [DONE]
+

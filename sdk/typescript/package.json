@@ -26,7 +26,8 @@
     }
   },
   "bin": {
-    "codex-security": "./bin/codex-security.mjs"
+    "codex-security": "./bin/codex-security.mjs",
+    "codex-security-proxy": "./bin/codex-security-proxy.mjs"
   },
   "files": [
     "bin",

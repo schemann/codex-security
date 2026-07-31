@@ -52,6 +52,7 @@ import {
   type CodexSecurityConfig,
   type JsonObject,
   type JsonValue,
+  type ScanProvider,
 } from "./config.js";
 import { formatUsd } from "./cost.js";
 import {
@@ -149,6 +150,7 @@ const EXPORT_DEFAULT_OUTPUTS = {
 } as const;
 const VALUE_OPTIONS = new Set([
   "--auth",
+  "--provider",
   "--path",
   "--knowledge-base",
   "--diff",
@@ -193,6 +195,7 @@ function effortOption() {
 
 interface ScanArguments {
   auth?: ScanAuthMode;
+  provider?: ScanProvider;
   repository?: string;
   paths: string[];
   knowledgeBasePaths: string[];
@@ -918,6 +921,12 @@ export async function main(
             .describe(
               "Select ChatGPT, OPENAI_API_KEY/CODEX_API_KEY, or automatic authentication.",
             ),
+          provider: z
+            .enum(["openai", "kimi"])
+            .optional()
+            .describe(
+              'Model provider: "openai" (default) or "kimi" (Kimi Code subscription via a local translation proxy; requires KIMI_API_KEY).',
+            ),
           path: z
             .array(optionValue("--path"))
             .default([])
@@ -1042,6 +1051,7 @@ export async function main(
         const outcome = await runScan(
           {
             auth: options.auth,
+            provider: options.provider,
             repository: args.repository,
             paths: options.path,
             knowledgeBasePaths: options.knowledgeBase,
@@ -2066,11 +2076,15 @@ async function runSkill(
   const overrides = parseCodexOverrides(codexOverrides, undefined, effort);
   if (
     Object.keys(overrides).some(
-      (key) => key !== "model" && key !== "model_reasoning_effort",
+      (key) =>
+        key !== "model" &&
+        key !== "model_reasoning_effort" &&
+        key !== "model_provider" &&
+        key !== "model_providers",
     )
   ) {
     throw new CodexSecurityError(
-      "Validation and patching only support model and model_reasoning_effort overrides.",
+      "Validation and patching only support model, model_reasoning_effort, model_provider, and model_providers overrides.",
     );
   }
   const { model, reasoningEffort } = scanModelConfiguration(
@@ -2436,6 +2450,9 @@ async function runScan(
     const config: CodexSecurityConfig = {
       pluginPath: arguments_.pluginPath,
       pythonPath: arguments_.pythonPath,
+      ...(arguments_.provider === undefined
+        ? {}
+        : { provider: arguments_.provider }),
       codexOverrides:
         arguments_.codexOverrides ??
         parseCodexOverrides(
@@ -2445,9 +2462,14 @@ async function runScan(
         ),
     };
     let auth = arguments_.auth;
-    selectedAuthentication = scanAuthentication(dependencies.environment, auth);
+    selectedAuthentication = scanAuthentication(
+      dependencies.environment,
+      auth,
+      arguments_.provider,
+    );
     if (
       (auth === undefined || auth === "auto") &&
+      arguments_.provider !== "kimi" &&
       !arguments_.dryRun &&
       interactive &&
       errorOutput.isTTY === true &&

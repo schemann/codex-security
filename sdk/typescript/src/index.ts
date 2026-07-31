@@ -30,10 +30,19 @@ export {
 export type { ProtectedScanPathKind } from "./errors.js";
 export {
   DEFAULT_CODEX_CONFIG,
+  KIMI_CODEX_PROVIDER_PRESET,
   mergedCodexConfig,
+  resolveScanProvider,
   writeCodexConfig,
 } from "./config.js";
-export type { CodexSecurityConfig, JsonObject, JsonValue } from "./config.js";
+export type {
+  CodexSecurityConfig,
+  JsonObject,
+  JsonValue,
+  ScanProvider,
+} from "./config.js";
+export { kimiProxyScriptPath, startKimiProxy } from "./kimi-proxy.js";
+export type { KimiProxyHandle, StartKimiProxyOptions } from "./kimi-proxy.js";
 export { loadContract, requireScanFile } from "./contract.js";
 export type { LoadedContract, ScanExpectation } from "./contract.js";
 export type * from "./models.js";

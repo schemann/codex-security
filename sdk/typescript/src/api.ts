@@ -14,12 +14,15 @@ import {
 } from "./auth.js";
 import {
   mergedCodexConfig,
+  resolveScanProvider,
   scanModelConfiguration,
   type CodexSecurityConfig,
   type JsonObject,
+  type ScanProvider,
   writeCodexConfig,
 } from "./config.js";
 import { estimateScanCost, ScanCostTracker, type ScanCost } from "./cost.js";
+import { startKimiProxy, type KimiProxyHandle } from "./kimi-proxy.js";
 import {
   loadContract,
   requireScanFile,
@@ -28,6 +31,7 @@ import {
 import {
   AuthenticationRequiredError,
   CodexSecurityError,
+  ContractValidationError,
   IncompleteScanError,
   OutputDirectoryError,
   OutputInsideProtectedRootError,
@@ -116,6 +120,7 @@ interface PreparedRuntime {
   environment: Record<string, string>;
   credentialsAvailable: boolean;
   effectiveConfig?: JsonObject;
+  kimiProxy?: KimiProxyHandle;
 }
 
 export interface ScanOptions {
@@ -150,7 +155,7 @@ export type ScanAuthMode = "auto" | "chatgpt" | "api-key";
 export type ScanAuthentication =
   | {
       method: "api_key";
-      source: "OPENAI_API_KEY" | "CODEX_API_KEY";
+      source: "OPENAI_API_KEY" | "CODEX_API_KEY" | "KIMI_API_KEY";
       verified: false;
     }
   | {
@@ -210,6 +215,7 @@ interface ClientDependencies {
   repositoryRevision?: typeof repositoryRevision;
   resolveCodexCommand?: () => CodexCommand;
   runWorkbench?: typeof runWorkbench;
+  startKimiProxy?: typeof startKimiProxy;
 }
 
 const DEFAULT_DEPENDENCIES: ClientDependencies = {
@@ -218,6 +224,13 @@ const DEFAULT_DEPENDENCIES: ClientDependencies = {
 };
 
 const SCAN_PERMISSION_PROFILE = "codex_security_scan";
+
+/**
+ * How often a Kimi scan may be continued in the same thread after the model
+ * ended its turn before all canonical scan artifacts exist (total runs per
+ * scan: 1 initial + 3 continuations).
+ */
+const KIMI_MAX_CONTINUATIONS = 3;
 
 export class CodexSecurity {
   public readonly config: Readonly<CodexSecurityConfig>;
@@ -271,7 +284,7 @@ export class CodexSecurity {
     );
     const configuration = await mergedCodexConfig(this.config);
     const model = scanModelConfiguration(configuration);
-    validateScanCostLimit(options.maxCostUsd, model.model);
+    warnIfCostLimitUnenforceable(options, model.model);
     const archiveDir =
       options.archiveExisting === true
         ? await planOutputArchive(inputs.outputDir)
@@ -289,6 +302,7 @@ export class CodexSecurity {
       authentication: scanAuthentication(
         this.#dependencies.environment,
         options.auth,
+        resolveScanProvider(this.config),
       ),
       ...model,
       ...(options.maxCostUsd === undefined
@@ -360,9 +374,11 @@ export class CodexSecurity {
       }
       checkOpen();
 
+      const provider = resolveScanProvider(this.config);
       const authentication = scanAuthentication(
         this.#dependencies.environment,
         options.auth,
+        provider,
       );
       const scanEnvironment = selectedScanEnvironment(
         this.#dependencies.environment,
@@ -423,14 +439,18 @@ export class CodexSecurity {
           ? "stored_credentials"
           : null;
       }
+      // OpenAI API keys are only relevant for the OpenAI provider; with the
+      // Kimi provider the proxy holds KIMI_API_KEY and the Codex subprocess
+      // talks unauthenticated to the loopback proxy.
       const apiKey =
-        authentication.method === "api_key"
+        provider !== "kimi" && authentication.method === "api_key"
           ? environmentApiKey(this.#dependencies.environment)
           : null;
       if (apiKey !== null) {
         this.#runtimeCredentialSource = "api_key";
       }
       if (
+        provider !== "kimi" &&
         !runtime.credentialsAvailable &&
         authentication.method === "stored_credentials"
       ) {
@@ -444,7 +464,14 @@ export class CodexSecurity {
           ? "stored_credentials"
           : null;
       }
-      if (!runtime.credentialsAvailable && apiKey === null) {
+      if (provider === "kimi") {
+        if (authentication.method !== "api_key") {
+          throw new AuthenticationRequiredError(
+            "The Kimi provider requires KIMI_API_KEY to be set. " +
+              "No OpenAI login is used for provider 'kimi'.",
+          );
+        }
+      } else if (!runtime.credentialsAvailable && apiKey === null) {
         throw new AuthenticationRequiredError(
           "No credentials were found. Run 'codex-security login', use " +
             "'codex-security login --device-auth' on a remote or headless machine, or set " +
@@ -536,7 +563,7 @@ export class CodexSecurity {
       const effectiveConfig =
         runtime.effectiveConfig ?? (await mergedCodexConfig(this.config));
       const { model } = scanModelConfiguration(effectiveConfig);
-      validateScanCostLimit(options.maxCostUsd, model);
+      warnIfCostLimitUnenforceable(options, model);
       const tracker = new ScanCostTracker({
         codexHome: runtime.codexHome,
         model,
@@ -768,45 +795,78 @@ export class CodexSecurity {
         await chmod(targetPathsFile, 0o400);
       }
       checkOpen();
-      const { events } = await thread.runStreamed(prompt, {
-        signal,
-      });
-      checkOpen();
-
-      const result = await runScanEvents({
-        thread,
-        events,
-        signal,
-        scanDir,
-        pluginRoot: runtime.plugin.installedRoot,
-        expectation,
-        workbenchValidated: true,
-        model,
-        onThreadStarted: (threadId) => tracker.start(threadId),
-        onFinalize: async (usage) => {
-          const snapshot = await tracker.stop(usage);
-          throwIfAborted(signal, scanDir);
-          if (options.maxCostUsd !== undefined && snapshot.cost === null) {
-            notifyObserver(
-              "onWarning",
-              options.onWarning,
-              options.onObserverError,
-              "Scan completed, but its cost limit could not be verified because model pricing or token usage is unavailable.",
-            );
+      // Continuation loop: Kimi K3 sometimes ends a turn early
+      // (finish_reason=stop) before the scan pipeline wrote all canonical
+      // artifacts. Because store=false keeps the full context in the thread,
+      // re-running the same thread with a short continuation prompt lets the
+      // model pick up where it stopped. Only enabled for the Kimi provider;
+      // the OpenAI path runs exactly once, as before.
+      const maxContinuations = provider === "kimi" ? KIMI_MAX_CONTINUATIONS : 0;
+      let continuationPrompt = prompt;
+      let result: ScanResult;
+      for (let attempt = 0; ; attempt += 1) {
+        const { events } = await thread.runStreamed(continuationPrompt, {
+          signal,
+        });
+        checkOpen();
+        try {
+          result = await runScanEvents({
+            thread,
+            events,
+            signal,
+            scanDir,
+            pluginRoot: runtime.plugin.installedRoot,
+            expectation,
+            workbenchValidated: true,
+            model,
+            onThreadStarted: (threadId) => tracker.start(threadId),
+            onFinalize: async (usage) => {
+              // Cost tracking across continuations: tracker.stop() re-reads
+              // the thread's session file, whose total_token_usage is
+              // cumulative across turns of the same thread, so the snapshot
+              // of the final (successful) attempt already includes the
+              // earlier continuation turns. The last stop() call wins.
+              const snapshot = await tracker.stop(usage);
+              throwIfAborted(signal, scanDir);
+              if (options.maxCostUsd !== undefined && snapshot.cost === null) {
+                notifyObserver(
+                  "onWarning",
+                  options.onWarning,
+                  options.onObserverError,
+                  "Scan completed, but its cost limit could not be verified because model pricing or token usage is unavailable.",
+                );
+              }
+              completionCost = snapshot.cost;
+              await workbench(workbenchOptions, [
+                "prepare-scan-completion",
+                "--scan-id",
+                scanId,
+              ]);
+              return snapshot.usage;
+            },
+            onScanStarted: options.onScanStarted,
+            onReconnect: options.onReconnect,
+            onWorkerStatus: options.onWorkerStatus,
+            onObserverError: options.onObserverError,
+          });
+          break;
+        } catch (error) {
+          if (
+            attempt >= maxContinuations ||
+            signal.aborted ||
+            !isMissingScanArtifactError(error)
+          ) {
+            throw error;
           }
-          completionCost = snapshot.cost;
-          await workbench(workbenchOptions, [
-            "prepare-scan-completion",
-            "--scan-id",
-            scanId,
-          ]);
-          return snapshot.usage;
-        },
-        onScanStarted: options.onScanStarted,
-        onReconnect: options.onReconnect,
-        onWorkerStatus: options.onWorkerStatus,
-        onObserverError: options.onObserverError,
-      });
+          notifyObserver(
+            "onWarning",
+            options.onWarning,
+            options.onObserverError,
+            `The model ended its turn before the scan artifacts were complete; continuing in the same thread (attempt ${attempt + 2}/${maxContinuations + 1}).`,
+          );
+          continuationPrompt = scanContinuationPrompt(error);
+        }
+      }
       checkOpen();
       const completion = await workbench(workbenchOptions, [
         "complete-scan",
@@ -1013,14 +1073,15 @@ export class CodexSecurity {
   }
 
   async #cleanupRuntime(runtime: PreparedRuntime): Promise<void> {
-    const cleanupResults = await Promise.allSettled(
-      [
+    const cleanupResults = await Promise.allSettled([
+      runtime.kimiProxy?.close(),
+      ...[
         runtime.persistentCredentialHome ? undefined : runtime.codexHome,
         runtime.bootstrapWorkspace,
       ]
         .filter((path): path is string => path !== undefined)
         .map((path) => cleanupSdkDirectory(path)),
-    );
+    ]);
     for (const result of cleanupResults) {
       if (result.status === "rejected") throw result.reason;
     }
@@ -1213,9 +1274,10 @@ export class CodexSecurity {
       this.#dependencies.environment,
       auth,
     );
+    const provider = resolveScanProvider(this.config);
     const persistentCredentialHome =
-      scanAuthentication(this.#dependencies.environment, auth).method ===
-      "stored_credentials";
+      scanAuthentication(this.#dependencies.environment, auth, provider)
+        .method === "stored_credentials";
     const codexHome = persistentCredentialHome
       ? await prepareCodexSecurityCredentialHome(
           processEnvironment,
@@ -1223,6 +1285,7 @@ export class CodexSecurity {
         )
       : await createIsolatedHome(temporaryRoot, validateLocation);
     let bootstrapWorkspace: string | undefined;
+    let kimiProxy: KimiProxyHandle | undefined;
     try {
       throwIfAborted(signal);
       bootstrapWorkspace = await createIsolatedHome(
@@ -1241,6 +1304,25 @@ export class CodexSecurity {
       );
       const ambientHome = configuredAmbientHome ?? nodeAmbientHome;
       const mergedConfig = await mergedCodexConfig(this.config);
+      // With the Kimi provider, spawn the local translation proxy now and
+      // point the Codex `kimi` provider at its ephemeral loopback port. The
+      // proxy child belongs to this runtime and is killed on cleanup.
+      if (provider === "kimi") {
+        const kimiApiKey = environmentKimiApiKey(processEnvironment);
+        if (kimiApiKey === null) {
+          throw new AuthenticationRequiredError(
+            "The Kimi provider requires KIMI_API_KEY to be set.",
+          );
+        }
+        const spawnProxy = this.#dependencies.startKimiProxy ?? startKimiProxy;
+        kimiProxy = await spawnProxy({ apiKey: kimiApiKey, signal });
+        try {
+          injectKimiProxyBaseUrl(mergedConfig, kimiProxy.baseUrl);
+        } catch (error) {
+          await kimiProxy.close().catch(() => undefined);
+          throw error;
+        }
+      }
       const codexConfig = await preserveCodexSecurityPluginRegistration(
         codexHome,
         scanRuntimeCodexConfig(
@@ -1279,13 +1361,18 @@ export class CodexSecurity {
         },
         credentialsAvailable,
         effectiveConfig: mergedConfig,
+        ...(kimiProxy === undefined ? {} : { kimiProxy }),
       };
     } catch (error) {
-      const cleanupResults = await Promise.allSettled(
-        [bootstrapWorkspace, persistentCredentialHome ? undefined : codexHome]
+      const cleanupResults = await Promise.allSettled([
+        kimiProxy?.close(),
+        ...[
+          bootstrapWorkspace,
+          persistentCredentialHome ? undefined : codexHome,
+        ]
           .filter((path): path is string => path !== undefined)
           .map((path) => cleanupSdkDirectory(path)),
-      );
+      ]);
       const cleanupFailures = cleanupResults.flatMap((result) =>
         result.status === "rejected" ? [result.reason] : [],
       );
@@ -1481,6 +1568,41 @@ export async function runScanEvents(
   }
 }
 
+/**
+ * Matches errors caused by missing or invalid canonical scan artifacts
+ * (scan-manifest.json, findings.json, coverage.json): the incomplete-scan
+ * signal from the event/collector path, contract validation failures, and
+ * workbench completion-preflight failures. Those name either the artifact
+ * file ("scan-manifest.json: expected a regular file ...") or the schema
+ * path of an invalid artifact ("scan-manifest.schema.scan.scope...:
+ * expected schema type ..."). Genuine model/stream/auth failures
+ * (CodexSecurityError from turn.failed or error events) name neither and
+ * are not retried; aborts (ScanInterruptedError) never are.
+ */
+const SCAN_ARTIFACT_ERROR_PATTERN =
+  /(?:scan-manifest|findings|coverage)(?:\.json|\.schema)/;
+
+function isMissingScanArtifactError(error: unknown): boolean {
+  if (error instanceof ScanInterruptedError) return false;
+  if (error instanceof IncompleteScanError) return true;
+  if (error instanceof ContractValidationError) return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return SCAN_ARTIFACT_ERROR_PATTERN.test(message);
+}
+
+function scanContinuationPrompt(error: unknown): string {
+  const detail = (error instanceof Error ? error.message : String(error))
+    .replaceAll(/\s+/g, " ")
+    .trim()
+    .slice(0, 300);
+  return [
+    `The Codex Security scan is not complete: ${detail}`,
+    'Continue the same scan pipeline from where you stopped and write the remaining canonical files (scan-manifest.json, findings.json, coverage.json) to "$CODEX_SECURITY_SCAN_DIR" exactly as instructed.',
+    "Do not restart completed phases and do not repeat finished analysis; reuse the existing contents of the artifacts/ directory.",
+    'Use exactly "$CODEX_SECURITY_SCAN_ID" as the scan ID and "$CODEX_SECURITY_TARGET_ID" as scan.target.targetId in every file.',
+  ].join("\n");
+}
+
 async function scanPrompt(
   pluginRoot: string,
   target: NormalizedTarget,
@@ -1585,16 +1707,47 @@ function scanRecipe(
   };
 }
 
-function validateScanCostLimit(
-  maxCostUsd: number | undefined,
+function costLimitEnforceable(model: string): boolean {
+  return (
+    estimateScanCost(model, { input_tokens: 0, output_tokens: 0 }) !== null
+  );
+}
+
+/**
+ * Point the Codex `kimi` provider inside the merged config at the freshly
+ * spawned loopback proxy. The preset guarantees model_providers.kimi exists;
+ * the shape is rebuilt defensively because codexOverrides could have
+ * replaced it with a non-table value.
+ */
+function injectKimiProxyBaseUrl(config: JsonObject, baseUrl: string): void {
+  const providers = isRecord(config["model_providers"])
+    ? (config["model_providers"] as JsonObject)
+    : {};
+  config["model_providers"] = providers;
+  const kimi = isRecord(providers["kimi"])
+    ? (providers["kimi"] as JsonObject)
+    : {};
+  providers["kimi"] = kimi;
+  kimi["base_url"] = baseUrl;
+}
+
+/**
+ * Unknown models (e.g. Kimi's k3-256k, billed flat via subscription) have no
+ * pricing table entry, so a scan cost limit cannot be enforced for them. That
+ * is a warning, not an error: the scan is allowed to proceed.
+ */
+function warnIfCostLimitUnenforceable(
+  options: Pick<ScanOptions, "maxCostUsd" | "onWarning" | "onObserverError">,
   model: string,
 ): void {
-  if (maxCostUsd === undefined) return;
-  if (estimateScanCost(model, { input_tokens: 0, output_tokens: 0 }) === null) {
-    throw new CodexSecurityError(
-      `A scan cost limit is not available for the configured model: ${model}.`,
-    );
-  }
+  if (options.maxCostUsd === undefined) return;
+  if (costLimitEnforceable(model)) return;
+  notifyObserver(
+    "onWarning",
+    options.onWarning,
+    options.onObserverError,
+    `Cost estimate unavailable for this model (${model}); the scan cost limit cannot be enforced.`,
+  );
 }
 
 async function collectResult(
@@ -1657,7 +1810,22 @@ async function collectResult(
 export function scanAuthentication(
   environment: ProcessEnvironment,
   auth: ScanAuthMode = "auto",
+  provider: ScanProvider = "openai",
 ): ScanAuthentication {
+  if (provider === "kimi") {
+    // The Kimi provider authenticates exclusively through KIMI_API_KEY; no
+    // OpenAI login is involved.
+    const kimiKey = environmentKimiApiKey(environment);
+    if (auth === "api-key" && kimiKey === null) {
+      throw new AuthenticationRequiredError(
+        "API-key authentication with provider 'kimi' requires KIMI_API_KEY. " +
+          "Set a valid Kimi API key.",
+      );
+    }
+    return kimiKey === null
+      ? { method: "stored_credentials", verified: false }
+      : { method: "api_key", source: "KIMI_API_KEY", verified: false };
+  }
   if (auth === "chatgpt") {
     return { method: "stored_credentials", verified: false };
   }
@@ -1671,6 +1839,10 @@ export function scanAuthentication(
   return key === null
     ? { method: "stored_credentials", verified: false }
     : { method: "api_key", source: key.source, verified: false };
+}
+
+function environmentKimiApiKey(environment: ProcessEnvironment): string | null {
+  return environmentValue(environment, "KIMI_API_KEY") ?? null;
 }
 
 function selectedScanEnvironment(

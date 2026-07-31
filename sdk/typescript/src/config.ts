@@ -10,8 +10,11 @@ export interface JsonObject {
   [key: string]: JsonValue;
 }
 
+export type ScanProvider = "openai" | "kimi";
+
 export interface CodexSecurityConfig {
   pluginPath?: string;
+  provider?: ScanProvider;
   codexOverrides?: JsonObject;
   pythonPath?: string;
 }
@@ -41,6 +44,37 @@ export const DEFAULT_CODEX_CONFIG: Readonly<JsonObject> = {
 
 deepFreezeJson(DEFAULT_CODEX_CONFIG);
 
+/**
+ * Codex configuration preset for the Kimi Code subscription provider. The
+ * local translation proxy (bin/codex-security-proxy.mjs) speaks the Responses
+ * API towards Codex and Chat Completions towards Kimi; its loopback base_url
+ * is injected at runtime when the proxy is spawned, so it is intentionally
+ * absent here.
+ */
+export const KIMI_CODEX_PROVIDER_PRESET: Readonly<JsonObject> = {
+  model: "k3-256k",
+  model_reasoning_effort: "high",
+  model_provider: "kimi",
+  model_providers: {
+    kimi: {
+      name: "Kimi",
+      wire_api: "responses",
+    },
+  },
+};
+
+deepFreezeJson(KIMI_CODEX_PROVIDER_PRESET);
+
+export function resolveScanProvider(config: CodexSecurityConfig): ScanProvider {
+  const provider = config.provider ?? "openai";
+  if (provider !== "openai" && provider !== "kimi") {
+    throw new ConfigurationError(
+      `Unknown Codex provider: ${String(config.provider)}. Expected "openai" or "kimi".`,
+    );
+  }
+  return provider;
+}
+
 export function scanModelConfiguration(
   config: Readonly<JsonObject>,
 ): ScanModelConfiguration {
@@ -65,6 +99,7 @@ export function scanModelConfiguration(
 export async function mergedCodexConfig(
   config: CodexSecurityConfig,
 ): Promise<JsonObject> {
+  const provider = resolveScanProvider(config);
   if (config.codexOverrides !== undefined && !isObject(config.codexOverrides)) {
     throw new ConfigurationError("codexOverrides must be an object.");
   }
@@ -81,7 +116,16 @@ export async function mergedCodexConfig(
       }
     }
   }
-  return deepMerge(cloneJson(DEFAULT_CODEX_CONFIG), overrides);
+  // The Kimi preset replaces the OpenAI model defaults; explicit
+  // codexOverrides still win over the preset.
+  const base =
+    provider === "kimi"
+      ? deepMerge(
+          cloneJson(DEFAULT_CODEX_CONFIG),
+          cloneJson(KIMI_CODEX_PROVIDER_PRESET),
+        )
+      : cloneJson(DEFAULT_CODEX_CONFIG);
+  return deepMerge(base, overrides);
 }
 
 function normalizeLegacyWindowsSandboxOverride(overrides: JsonObject): void {
