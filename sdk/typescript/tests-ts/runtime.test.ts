@@ -7,8 +7,10 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readlink,
   realpath,
   readdir,
+  rename,
   rm,
   stat,
   symlink,
@@ -49,6 +51,7 @@ import {
   bundledPluginCandidates,
   codexSecurityCredentialAllowsAmbientImport,
   codexSecurityCredentialHome,
+  codexSecurityHasStoredFileCredentials,
   codexSecurityStateDirectory,
   codexPlatformPackage,
   isPythonPathCandidate,
@@ -56,7 +59,11 @@ import {
   prepareCodexSecurityCredentialHome,
   preparePersistentScanRoot,
   requirePrivateCredentialHome,
+  requirePrivateCredentialFile,
   requirePrivateOutputDirectory,
+  requireSecureCredentialHome,
+  requireSecureOutputAncestry,
+  requireTrustedOutputAncestor,
   runWorkbench,
   setCodexSecurityCredentialLogout,
 } from "../src/runtime.js";
@@ -383,6 +390,92 @@ describe("plugin runtime preparation", () => {
         ),
       ),
     ).toBeDefined();
+  });
+
+  test("bounds configured plugin directory discovery", async () => {
+    const overflowRoot = await temporaryDirectory();
+    const overflowSource = await plugin(overflowRoot);
+    const overflowDirectory = join(overflowSource, "many-files");
+    await mkdir(overflowDirectory);
+    for (let offset = 0; offset < 4_096; offset += 128) {
+      await Promise.all(
+        Array.from({ length: 128 }, (_value, index) =>
+          writeFile(join(overflowDirectory, String(offset + index)), ""),
+        ),
+      );
+    }
+    const overflowDestination = join(overflowRoot, "overflow-home");
+    await expect(
+      createMarketplace(overflowDestination, overflowSource),
+    ).rejects.toThrow("copy entry limit");
+    expect(
+      existsSync(
+        join(
+          overflowDestination,
+          "sdk-marketplace",
+          "plugins",
+          "codex-security",
+        ),
+      ),
+    ).toBe(false);
+  });
+
+  test("cancels configured plugin directory discovery", async () => {
+    const cancellationRoot = await temporaryDirectory();
+    const cancellationSource = await plugin(cancellationRoot);
+    const cancellationDirectory = join(cancellationSource, "many-files");
+    await mkdir(cancellationDirectory);
+    await Promise.all(
+      Array.from({ length: 32 }, (_value, index) =>
+        writeFile(join(cancellationDirectory, String(index)), ""),
+      ),
+    );
+    const cancellationDestination = join(cancellationRoot, "canceled-home");
+    const controller = new AbortController();
+    const originalOpendir = fsPromises.opendir;
+    let discovered = 0;
+    mock.module("node:fs/promises", () => ({
+      ...fsPromises,
+      opendir: async (...args: Parameters<typeof originalOpendir>) => {
+        const directory = await originalOpendir(...args);
+        if (String(args[0]) !== cancellationDirectory) return directory;
+        const originalRead = directory.read.bind(directory);
+        directory.read = async () => {
+          const entry = await originalRead();
+          discovered += 1;
+          if (discovered === 2) {
+            controller.abort(new DOMException("canceled", "AbortError"));
+          }
+          return entry;
+        };
+        return directory;
+      },
+    }));
+    try {
+      await expect(
+        createMarketplace(
+          cancellationDestination,
+          cancellationSource,
+          controller.signal,
+        ),
+      ).rejects.toMatchObject({ name: "AbortError" });
+      expect(discovered).toBe(2);
+      expect(
+        existsSync(
+          join(
+            cancellationDestination,
+            "sdk-marketplace",
+            "plugins",
+            "codex-security",
+          ),
+        ),
+      ).toBe(false);
+    } finally {
+      mock.module("node:fs/promises", () => ({
+        ...fsPromises,
+        opendir: originalOpendir,
+      }));
+    }
   });
 
   testPosix(
@@ -738,14 +831,50 @@ describe("plugin runtime preparation", () => {
     }
   });
 
+  test("imports ambient auth when credential files do not support hard links", async () => {
+    const root = await temporaryDirectory();
+    const ambient = join(root, "ambient");
+    const isolated = join(root, "isolated");
+    await mkdir(ambient);
+    await writeFile(join(ambient, "auth.json"), '{"token":"portable"}\n');
+    const originalLink = fsPromises.link;
+    mock.module("node:fs/promises", () => ({
+      ...fsPromises,
+      link: async () => {
+        const error = new Error(
+          "hard links are unsupported",
+        ) as NodeJS.ErrnoException;
+        error.code = "ENOTSUP";
+        throw error;
+      },
+    }));
+    try {
+      expect(await importAmbientAuth(ambient, isolated)).toBe(true);
+      expect(await readFile(join(isolated, "auth.json"), "utf8")).toBe(
+        '{"token":"portable"}\n',
+      );
+    } finally {
+      mock.module("node:fs/promises", () => ({
+        ...fsPromises,
+        link: originalLink,
+      }));
+    }
+  });
+
   test("never replaces an explicitly stored sign-in with ambient credentials", async () => {
     const root = await temporaryDirectory();
     const ambient = join(root, "ambient");
     const isolated = join(root, "isolated");
     await mkdir(ambient);
-    await mkdir(isolated);
+    await mkdir(isolated, { mode: 0o700 });
+    if (process.platform !== "win32") await chmod(isolated, 0o700);
     await writeFile(join(ambient, "auth.json"), '{"token":"ambient"}\n');
-    await writeFile(join(isolated, "auth.json"), '{"token":"explicit"}\n');
+    await writeFile(join(isolated, "auth.json"), '{"token":"explicit"}\n', {
+      mode: 0o600,
+    });
+    if (process.platform !== "win32") {
+      await chmod(join(isolated, "auth.json"), 0o600);
+    }
 
     expect(await importAmbientAuth(ambient, isolated)).toBe(true);
     expect(await readFile(join(isolated, "auth.json"), "utf8")).toBe(
@@ -1226,6 +1355,165 @@ describe("runtime directories and plugin Python boundary", () => {
     ).rejects.toThrow("credential home is not a directory");
   });
 
+  testPosix(
+    "rejects credential homes under a non-sticky shared parent directory",
+    async () => {
+      const root = await temporaryDirectory();
+      const shared = join(root, "shared");
+      await mkdir(shared, { mode: 0o777 });
+      await chmod(shared, 0o777);
+      expect((await lstat(shared)).mode & 0o1000).toBe(0);
+      const environment = { CODEX_SECURITY_STATE_DIR: join(shared, "state") };
+
+      await expect(
+        prepareCodexSecurityCredentialHome(environment),
+      ).rejects.toThrow("sticky bit");
+      await expect(
+        requireSecureOutputAncestry(join(shared, "state")),
+      ).rejects.toThrow("sticky bit");
+    },
+  );
+
+  testPosix(
+    "accepts credential homes under a sticky shared parent directory",
+    async () => {
+      const root = await temporaryDirectory();
+      // Some filesystems (notably user dirs on macOS APFS) ignore sticky on
+      // chmod; fall back to the process temp root when it is already sticky.
+      let stickyParent = join(root, "shared");
+      await mkdir(stickyParent, { mode: 0o1777 });
+      await chmod(stickyParent, 0o1777);
+      if (((await lstat(stickyParent)).mode & 0o1000) === 0) {
+        stickyParent = await realpath(tmpdir());
+        if (((await lstat(stickyParent)).mode & 0o1000) === 0) {
+          return;
+        }
+      }
+      const stateDirectory = join(
+        stickyParent,
+        `codex-security-sticky-${process.pid}-${Date.now()}`,
+      );
+      temporaryDirectories.push(stateDirectory);
+      await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
+      const home = await prepareCodexSecurityCredentialHome({
+        CODEX_SECURITY_STATE_DIR: stateDirectory,
+      });
+      await expect(requireSecureCredentialHome(home)).resolves.toBeDefined();
+      await expect(requireSecureOutputAncestry(home)).resolves.toBeUndefined();
+    },
+  );
+
+  testPosix("rejects sticky shared parents controlled by another user", () => {
+    expect(() =>
+      requireTrustedOutputAncestor(
+        { mode: 0o41777, uid: 1001 },
+        "/shared",
+        1000,
+      ),
+    ).toThrow("trusted owner");
+    expect(() =>
+      requireTrustedOutputAncestor(
+        { mode: 0o40755, uid: 1001 },
+        "/shared",
+        1000,
+      ),
+    ).toThrow("trusted owner");
+    expect(() =>
+      requireTrustedOutputAncestor(
+        { mode: 0o41777, uid: 1000 },
+        "/shared",
+        1000,
+      ),
+    ).not.toThrow();
+    expect(() =>
+      requireTrustedOutputAncestor({ mode: 0o41777, uid: 0 }, "/tmp", 1000),
+    ).not.toThrow();
+  });
+
+  testPosix(
+    "rejects a credential home that is no longer private to the current user",
+    async () => {
+      const root = await temporaryDirectory();
+      const home = await prepareCodexSecurityCredentialHome({
+        CODEX_SECURITY_STATE_DIR: join(root, "state"),
+      });
+      await chmod(home, 0o755);
+      await expect(requireSecureCredentialHome(home)).rejects.toThrow(
+        "must not be accessible to other users",
+      );
+      await expect(
+        acquireCodexSecurityCredentialHomeLock(home),
+      ).rejects.toThrow("must not be accessible to other users");
+    },
+  );
+
+  testPosix(
+    "pins credential-home identity for the duration of a lock session",
+    async () => {
+      const root = await temporaryDirectory();
+      const home = await prepareCodexSecurityCredentialHome({
+        CODEX_SECURITY_STATE_DIR: join(root, "state"),
+      });
+      const release = await acquireCodexSecurityCredentialHomeLock(home);
+      const stolen = join(root, "stolen-home");
+      await rename(home, stolen);
+      await mkdir(home, { recursive: true, mode: 0o700 });
+      await chmod(home, 0o700);
+      await expect(release()).rejects.toThrow("credential home was replaced");
+    },
+  );
+
+  testPosix(
+    "rejects stale credential-home metadata after canonical target replacement",
+    async () => {
+      const root = await temporaryDirectory();
+      const home = await prepareCodexSecurityCredentialHome({
+        CODEX_SECURITY_STATE_DIR: join(root, "state"),
+      });
+      const stale = await lstat(home);
+      await rename(home, join(root, "original-home"));
+      await mkdir(home, { mode: 0o700 });
+
+      await expect(
+        requireSecureCredentialHome(home, { metadata: stale }),
+      ).rejects.toThrow("credential home was replaced");
+    },
+  );
+
+  testPosix(
+    "rejects world-writable or symlink stored authentication files",
+    async () => {
+      const root = await temporaryDirectory();
+      const home = await prepareCodexSecurityCredentialHome({
+        CODEX_SECURITY_STATE_DIR: join(root, "state"),
+      });
+      const authPath = join(home, "auth.json");
+      await writeFile(authPath, '{"token":"test"}\n', { mode: 0o600 });
+      expect(await codexSecurityHasStoredFileCredentials(home)).toBe(true);
+
+      await chmod(authPath, 0o644);
+      await expect(codexSecurityHasStoredFileCredentials(home)).rejects.toThrow(
+        "must not be accessible to other users",
+      );
+      await rm(authPath);
+
+      const target = join(home, "auth-target.json");
+      await writeFile(target, '{"token":"test"}\n', { mode: 0o600 });
+      await symlink(target, authPath);
+      await expect(codexSecurityHasStoredFileCredentials(home)).rejects.toThrow(
+        "not a regular file",
+      );
+
+      expect(() =>
+        requirePrivateCredentialFile(
+          { mode: 0o100644, uid: 1000 },
+          authPath,
+          1000,
+        ),
+      ).toThrow("must not be accessible to other users");
+    },
+  );
+
   test("identifies a credential home that already exists as a regular file", async () => {
     const root = await temporaryDirectory();
     const stateDirectory = join(root, "state");
@@ -1276,6 +1564,43 @@ describe("runtime directories and plugin Python boundary", () => {
     controller.abort(new DOMException("canceled", "AbortError"));
 
     try {
+      await expect(waiting).rejects.toMatchObject({ name: "AbortError" });
+    } finally {
+      await release();
+    }
+  });
+
+  test("does not rewrite Windows credential ACLs while polling a held lock", async () => {
+    const root = await temporaryDirectory();
+    const home = join(root, "credential-home");
+    await mkdir(home, { mode: 0o700 });
+    const validations: string[] = [];
+    const securityOptions = {
+      platform: "win32" as const,
+      secureWindowsHome: async (path: string) => {
+        const lock = join(path, ".codex-security-scan.lock");
+        expect(existsSync(lock) && !existsSync(join(lock, "owner.json"))).toBe(
+          false,
+        );
+        validations.push(path);
+      },
+    };
+    const release = await acquireCodexSecurityCredentialHomeLock(
+      home,
+      undefined,
+      securityOptions,
+    );
+    const controller = new AbortController();
+    const waiting = acquireCodexSecurityCredentialHomeLock(
+      home,
+      controller.signal,
+      securityOptions,
+    );
+
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(validations).toHaveLength(3);
+      controller.abort(new DOMException("canceled", "AbortError"));
       await expect(waiting).rejects.toMatchObject({ name: "AbortError" });
     } finally {
       await release();
@@ -1345,6 +1670,30 @@ describe("runtime directories and plugin Python boundary", () => {
         platform: "win32",
         secureWindowsHome: async () => {
           throw new Error("ACL could not be secured");
+        },
+      }),
+    ).rejects.toThrow("private Windows credential home");
+  });
+
+  test("revalidates the Windows credential ACL every time the home is used", async () => {
+    const root = await temporaryDirectory();
+    const home = join(root, "home");
+    await mkdir(home);
+    const validations: string[] = [];
+
+    await requireSecureCredentialHome(home, {
+      platform: "win32",
+      secureWindowsHome: async (path) => {
+        validations.push(path);
+      },
+    });
+
+    expect(validations).toEqual([home]);
+    await expect(
+      requireSecureCredentialHome(home, {
+        platform: "win32",
+        secureWindowsHome: async () => {
+          throw new Error("ACL changed after preparation");
         },
       }),
     ).rejects.toThrow("private Windows credential home");
@@ -1510,6 +1859,132 @@ describe("runtime directories and plugin Python boundary", () => {
     expect(result).toEqual({ ok: true });
   });
 
+  test.each([
+    ["all required draft artifacts", []],
+    ["the manifest draft", ["findings.json", "coverage.json"]],
+    ["the findings draft", ["scan-manifest.json", "coverage.json"]],
+    ["the coverage draft", ["scan-manifest.json", "findings.json"]],
+  ] as const)(
+    "rejects recipe scans when the agent did not create %s",
+    async (_description, present) => {
+      const python = Bun.which("python3") ?? Bun.which("python");
+      expect(python).not.toBeNull();
+      const requiredDrafts = [
+        "scan-manifest.json",
+        "findings.json",
+        "coverage.json",
+      ] as const;
+      const root = await temporaryDirectory("codex-security-missing-drafts-");
+      const repository = join(root, "repository");
+      const scanDir = join(root, "scan");
+      await mkdir(repository);
+      await mkdir(scanDir, { mode: 0o700 });
+      const workbenchOptions = {
+        python: python!,
+        pluginRoot: PLUGIN_ROOT,
+        environment: {
+          PATH: process.env["PATH"],
+          CODEX_SECURITY_STATE_DIR: join(root, "state"),
+        },
+      };
+      const registration = await runWorkbench(workbenchOptions, [
+        "register-cli-scan",
+        "--repository",
+        repository,
+        "--scan-dir",
+        scanDir,
+        "--recipe-json",
+        JSON.stringify({
+          config: {},
+          mode: "standard",
+          repository,
+          target: { kind: "repository", paths: [] },
+        }),
+      ]);
+      await Promise.all(
+        present.map((filename) =>
+          copyFile(
+            join(PLUGIN_ROOT, "examples", "completed-scan", filename),
+            join(scanDir, filename),
+          ),
+        ),
+      );
+      const missing = requiredDrafts.filter(
+        (filename) => !present.some((candidate) => candidate === filename),
+      );
+
+      await expect(
+        runWorkbench(workbenchOptions, [
+          "complete-scan",
+          "--scan-id",
+          String(registration["scanId"]),
+        ]),
+      ).rejects.toThrow(
+        `Scan agent did not create required draft artifacts: ${missing.join(
+          ", ",
+        )}. Check that the scan agent can run shell commands and write to the scan directory before retrying.`,
+      );
+      expect((await readdir(scanDir)).sort()).toEqual([...present].sort());
+      const stored = await runWorkbench(workbenchOptions, [
+        "get-scan",
+        "--scan-id",
+        String(registration["scanId"]),
+      ]);
+      expect(stored["scan"]).toMatchObject({
+        progress: { status: "running" },
+      });
+    },
+  );
+
+  testPosix("rejects symlinked recipe scan draft artifacts", async () => {
+    const root = await temporaryDirectory("codex-security-symlinked-draft-");
+    const repository = join(root, "repository");
+    const scanDir = join(root, "scan");
+    await mkdir(repository);
+    await mkdir(scanDir, { mode: 0o700 });
+    const python = Bun.which("python3") ?? Bun.which("python");
+    expect(python).not.toBeNull();
+    const workbenchOptions = {
+      python: python!,
+      pluginRoot: PLUGIN_ROOT,
+      environment: {
+        PATH: process.env["PATH"],
+        CODEX_SECURITY_STATE_DIR: join(root, "state"),
+      },
+    };
+    const registration = await runWorkbench(workbenchOptions, [
+      "register-cli-scan",
+      "--repository",
+      repository,
+      "--scan-dir",
+      scanDir,
+      "--recipe-json",
+      JSON.stringify({
+        config: {},
+        mode: "standard",
+        repository,
+        target: { kind: "repository", paths: [] },
+      }),
+    ]);
+    await symlink(
+      join(root, "missing-manifest.json"),
+      join(scanDir, "scan-manifest.json"),
+    );
+
+    await expect(
+      runWorkbench(workbenchOptions, [
+        "complete-scan",
+        "--scan-id",
+        String(registration["scanId"]),
+      ]),
+    ).rejects.toThrow(
+      "scan-manifest.json: expected a regular file inside the scan directory.",
+    );
+    expect(await readlink(join(scanDir, "scan-manifest.json"))).toBe(
+      join(root, "missing-manifest.json"),
+    );
+  });
+
   test("preserves recorded artifact paths when archiving a completed scan", async () => {
     const root = await temporaryDirectory();
     const scanDir = join(root, "scan");
@@ -1661,6 +2136,80 @@ describe("runtime directories and plugin Python boundary", () => {
         "/scan",
         1000,
       ),
+    ).not.toThrow();
+  });
+
+  testPosix(
+    "rejects scan output under a non-sticky shared parent directory",
+    async () => {
+      const root = await temporaryDirectory();
+      const shared = join(root, "shared");
+      await mkdir(shared, { mode: 0o777 });
+      await chmod(shared, 0o777);
+      const output = join(shared, "results");
+
+      await expect(prepareOutputDir(output, "repo")).rejects.toThrow(
+        "sticky bit",
+      );
+      await expect(requireSecureOutputAncestry(output)).rejects.toThrow(
+        "sticky bit",
+      );
+    },
+  );
+
+  testPosix(
+    "accepts scan output under a sticky shared parent directory",
+    async () => {
+      const root = await temporaryDirectory();
+      const shared = join(root, "shared");
+      await mkdir(shared, { mode: 0o1777 });
+      await chmod(shared, 0o1777);
+      // Some filesystems (notably user dirs on macOS APFS) ignore sticky on
+      // chmod; fall back to the process temp root when it is already sticky.
+      let stickyParent = shared;
+      if (((await lstat(shared)).mode & 0o1000) === 0) {
+        stickyParent = await realpath(tmpdir());
+        if (((await lstat(stickyParent)).mode & 0o1000) === 0) {
+          return;
+        }
+      }
+      const output = join(
+        stickyParent,
+        `codex-security-sticky-${process.pid}-${Date.now()}`,
+      );
+      temporaryDirectories.push(output);
+
+      await expect(
+        requireSecureOutputAncestry(output),
+      ).resolves.toBeUndefined();
+      expect(await prepareOutputDir(output, "repo")).toBe(output);
+    },
+  );
+
+  testPosix("rejects sticky shared parents controlled by another user", () => {
+    expect(() =>
+      requireTrustedOutputAncestor(
+        { mode: 0o41777, uid: 1001 },
+        "/shared",
+        1000,
+      ),
+    ).toThrow("trusted owner");
+    expect(() =>
+      requireTrustedOutputAncestor(
+        { mode: 0o40755, uid: 1001 },
+        "/other-user",
+        1000,
+      ),
+    ).toThrow("trusted owner");
+    expect(() =>
+      requireTrustedOutputAncestor(
+        { mode: 0o41777, uid: 1000 },
+        "/shared",
+        1000,
+      ),
+    ).not.toThrow();
+    expect(() =>
+      requireTrustedOutputAncestor({ mode: 0o41777, uid: 0 }, "/tmp", 1000),
     ).not.toThrow();
   });
 
