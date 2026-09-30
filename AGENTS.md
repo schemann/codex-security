@@ -56,21 +56,22 @@ provider only, never for OpenAI.
 ## Upstream sync workflow
 
 Branch layout: `main` mirrors upstream and stays clean; all fork work lives
-on the `kimi` branch. Remotes: `origin` = schemann/codex-security (fork),
-`upstream` = openai/codex-security.
+on the `develop` branch (formerly `kimi`, renamed when the GLM provider
+joined — the branch carries every fork provider). Remotes:
+`origin` = schemann/codex-security (fork), `upstream` = openai/codex-security.
 
 To pull in upstream updates:
 
 ```bash
 git fetch upstream
 git checkout main && git merge --ff-only upstream/main
-git checkout kimi && git merge main
+git checkout develop && git merge main
 # resolve conflicts, then verify:
 cd sdk/typescript && corepack pnpm install && corepack pnpm lint && corepack pnpm build
 bun test tests-ts/kimi-provider.test.ts tests-ts/kimi-continuation.test.ts \
   tests-ts/proxy-server.test.ts tests-ts/proxy-translate-request.test.ts \
   tests-ts/proxy-translate-stream.test.ts
-git push origin main kimi
+git push origin main develop
 ```
 
 Typical conflict hotspots when upstream changes: `src/api.ts` (auth gate,
