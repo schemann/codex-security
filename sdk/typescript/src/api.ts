@@ -58,6 +58,7 @@ import {
   scanApprovalPolicy,
   scanModelConfiguration,
   scanModelProvider,
+  scanModel,
   type CodexSecurityConfig,
   type JsonObject,
   writeCodexConfig,
@@ -3578,10 +3579,10 @@ export class CodexSecurity {
         kimiProxy = await spawnProxy({
           apiKey: providerApiKey,
           signal,
-          extraEnv: proxiedProviderProxyEnv(
-            proxiedProvider,
-            processEnvironment,
-          ),
+          extraEnv: {
+            ...proxiedProviderProxyEnv(proxiedProvider, processEnvironment),
+            ...proxiedProviderModelMapEnv(mergedConfig),
+          },
         });
         try {
           injectProxiedProviderBaseUrl(
@@ -4344,6 +4345,22 @@ function proxiedProviderProxyEnv(
     env["PROXY_THINKING_STYLE"] = "toggle";
   }
   return env;
+}
+
+/**
+ * Codex occasionally issues an internal auto-review turn with the
+ * pseudo-model "codex-auto-review", which upstream subscription APIs do not
+ * know (Z.ai answers 400 Unknown Model). Map it onto the scan's model so the
+ * request rides the same proxied model.
+ */
+function proxiedProviderModelMapEnv(
+  config: JsonObject,
+): Record<string, string> {
+  const model = scanModel(config);
+  if (typeof model !== "string" || !model.trim()) return {};
+  return {
+    PROXY_MODEL_MAP: JSON.stringify({ "codex-auto-review": model.trim() }),
+  };
 }
 
 /**
