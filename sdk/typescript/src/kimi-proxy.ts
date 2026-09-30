@@ -26,6 +26,12 @@ export interface KimiProxyHandle {
 export interface StartKimiProxyOptions {
   apiKey: string;
   signal?: AbortSignal;
+  /**
+   * Additional child environment (never secrets other than the upstream
+   * credential itself): provider-specific tuning such as KIMI_BASE_URL,
+   * PROXY_THINKING_FIELD or PROXY_THINKING_STYLE.
+   */
+  extraEnv?: Record<string, string>;
 }
 
 const LISTENING_LINE = /PROXY_LISTENING port=(\d{1,5})/;
@@ -66,6 +72,7 @@ export async function startKimiProxy(
       PATH: process.env["PATH"] ?? "",
       KIMI_API_KEY: options.apiKey,
       PORT: "0",
+      ...options.extraEnv,
       ...(process.env["PROXY_LOG"] === "1" ? { PROXY_LOG: "1" } : {}),
     },
     stdio: ["ignore", "pipe", "pipe"],

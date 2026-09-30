@@ -68,6 +68,8 @@ export interface ProxyConfig {
   port: number;
   modelMap?: Record<string, string>;
   thinkingField?: string;
+  /** How mapped effort is expressed upstream: "toggle" = Z.ai GLM style. */
+  thinkingStyle?: "toggle";
   passthroughWebSearch?: boolean;
   log?: (message: string) => void;
   /** Injectable for tests; defaults to global fetch. */
@@ -129,6 +131,8 @@ export function proxyConfigFromEnv(
     port,
     modelMap: parseModelMap(env["PROXY_MODEL_MAP"]),
     thinkingField: env["PROXY_THINKING_FIELD"],
+    thinkingStyle:
+      env["PROXY_THINKING_STYLE"] === "toggle" ? "toggle" : undefined,
     passthroughWebSearch: env["PROXY_PASSTHROUGH_WEBSEARCH"] === "1",
     log: debug
       ? (message) => {
@@ -219,6 +223,7 @@ async function handleResponses(
     modelMap: config.modelMap,
     passthroughWebSearch: config.passthroughWebSearch,
     thinkingField: config.thinkingField,
+    thinkingStyle: config.thinkingStyle,
   };
   const translated = translateRequest(clientBody, translateOptions);
   const wantsStream = translated.stream;

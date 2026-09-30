@@ -1,30 +1,67 @@
 # Contributing
 
-Codex Security is developed in OpenAI's canonical repository and published to
-this repository through a one-way mirror. External pull requests cannot be
-imported into the canonical source.
+Thanks for helping improve Codex Security. We welcome bug reports, feature
+requests, documentation corrections, and feedback from open-source
+maintainers.
+
+## How this repository works
+
+`plugins/codex-security/` is the canonical source for the Codex Security
+plugin. Make plugin changes there.
+
+The npm runtime under `sdk/typescript/_bundled_plugin/` is generated from the
+plugin source by `pnpm run build:plugin` and automatically during `prepack` for
+packages and releases. Do not edit or commit files in that directory. See the
+[SDK testing guide](sdk/typescript/TESTING.md) for the generation and validation
+commands.
+
+Model-based evaluations live in [`evals/`](evals/README.md), outside the plugin
+source. Deterministic triage checks and the MCP reducer IPC regression remain
+part of normal CI.
+
+Search [existing issues](https://github.com/openai/codex-security/issues)
+before opening a new one.
+
+## Support for open-source projects
+
+If you maintain an open-source project,
+[open an issue](https://github.com/openai/codex-security/issues/new) with the
+repository, your role, and what you need. Support is best effort. Scan only
+repositories you trust and either own or have permission to assess.
 
 ## Report a bug
 
-Search [existing GitHub issues](https://github.com/openai/codex-security/issues)
-before opening a new one. Include the installed CLI or SDK version, operating
-system, reproduction steps, expected behavior, and the observed result.
+Include your CLI or SDK version, operating system, reproduction steps, and
+the expected and observed behavior. Remove credentials, private code,
+customer data, and security findings before posting.
 
-Remove API keys, access tokens, repository contents, security findings, and
-other sensitive information from public reports. Report security vulnerabilities
-privately as described in [SECURITY.md](SECURITY.md).
+## Suggest a feature or improve the documentation
 
-## Request a feature or improve the documentation
+Open an issue describing the problem and the workflow you want to support.
+Documentation corrections and safe examples are welcome.
+Use synthetic examples when documenting expected behavior.
+Keep example values fictional and safe to share.
+Do not include credentials or private information in examples.
 
-Open a GitHub issue describing the problem, the workflow you want to support,
-and any relevant product behavior. Documentation corrections and safe
-reproduction details are welcome in the issue discussion.
+## Report a security issue
 
-Maintainers review issues and carry accepted changes into the canonical source.
+Report Codex Security vulnerabilities privately as described in
+[SECURITY.md](SECURITY.md). Do not post vulnerabilities, exploit details,
+credentials, or sensitive scan results publicly.
+
+If a scan finds a vulnerability in another project, report it to that
+project's maintainers through their security policy.
 
 ## Dependency and release maintenance
 
-Maintainers update package dependencies and the committed lockfile in the
-canonical repository. The public release workflow installs that locked graph,
+Maintainers update package dependencies and committed lockfiles with the
+affected source. The public release workflow installs those locked graphs,
 tests the package, and publishes a verified artifact with npm provenance.
 GitHub Actions dependencies are maintained separately in this repository.
+
+[GitHub Releases](https://github.com/openai/codex-security/releases) is the
+canonical changelog. Maintainers should follow [RELEASING.md](RELEASING.md) to
+prepare, publish, verify, or repair a release.
+
+See the [SDK testing guide](sdk/typescript/TESTING.md) for local checks,
+test conventions, and the required and experimental CI jobs.

@@ -29,6 +29,17 @@ export interface TranslateRequestOptions {
    * PROXY_THINKING_FIELD accordingly and adjust here.
    */
   thinkingField?: string;
+  /**
+   * How the mapped effort is expressed in the upstream body:
+   *
+   * - "effort" (default): flat string value written to `thinkingField` —
+   *   Kimi Code style (`reasoning_effort: "high"`).
+   * - "toggle": boolean-ish object written to `thinkingField` — Z.ai GLM
+   *   style (`thinking: { type: "enabled" }`). Effort "low" maps to
+   *   `disabled`, every other effort to `enabled`; GLM models have no
+   *   effort ladder, only a thinking on/off switch.
+   */
+  thinkingStyle?: "effort" | "toggle";
 }
 
 export interface TranslatedRequest {
@@ -365,13 +376,18 @@ export function translateRequest(
     body["response_format"] = { type: "json_object" };
   }
 
-  // reasoning effort -> configurable Kimi thinking field (see
-  // TranslateRequestOptions.thinkingField for the assumption).
+  // reasoning effort -> configurable thinking field (see
+  // TranslateRequestOptions.thinkingField / thinkingStyle).
   const reasoning = asObject(source["reasoning"]);
   const effort = asString(reasoning?.["effort"]);
   if (effort) {
     const mapped = EFFORT_MAP[effort] ?? effort;
-    body[options.thinkingField ?? DEFAULT_THINKING_FIELD] = mapped;
+    const field = options.thinkingField ?? DEFAULT_THINKING_FIELD;
+    if (options.thinkingStyle === "toggle") {
+      body[field] = { type: mapped === "low" ? "disabled" : "enabled" };
+    } else {
+      body[field] = mapped;
+    }
   }
 
   // Deliberately NOT forwarded (Codex/OpenAI-private or unsupported):

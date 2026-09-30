@@ -12,6 +12,7 @@ import {
 } from "../src/index.js";
 import { scanAuthentication } from "../src/api.js";
 import {
+  GLM_CODEX_PROVIDER_PRESET,
   KIMI_CODEX_PROVIDER_PRESET,
   mergedCodexConfig,
   resolveScanProvider,
@@ -48,8 +49,8 @@ const TestClientBase = CodexSecurity as unknown as new (
 
 const TEST_SNAPSHOT_DIGEST = `codex-security-snapshot/v1:sha256:${"a".repeat(64)}`;
 
-function mockScanRegistration(args: readonly string[]) {
-  const recipe = JSON.parse(args[args.indexOf("--recipe-json") + 1]!) as {
+function mockScanRegistration(args: readonly string[], input?: string) {
+  const recipe = JSON.parse(input!).recipe as {
     repositoryRevision?: string;
     target: { kind: string };
   };
@@ -82,9 +83,13 @@ class TestClient extends TestClientBase {
     dependencies: Record<string, unknown>,
   ) {
     super(config, {
-      runWorkbench: async (_options: unknown, args: readonly string[]) => {
+      runWorkbench: async (
+        _options: unknown,
+        args: readonly string[],
+        input?: string,
+      ) => {
         if (args[0] === "register-cli-scan") {
-          return mockScanRegistration(args);
+          return mockScanRegistration(args, input);
         }
         if (args[0] === "get-scan-feedback") {
           return {
@@ -120,7 +125,7 @@ describe("provider configuration", () => {
   test("defaults to the OpenAI provider and leaves its config untouched", async () => {
     expect(resolveScanProvider({})).toBe("openai");
     const merged = await mergedCodexConfig({});
-    expect(merged["model"]).toBe("gpt-5.6-sol");
+    expect(merged["model"]).toBe("gpt-6-sol");
     expect(merged["model_reasoning_effort"]).toBe("xhigh");
     expect(merged["model_provider"]).toBeUndefined();
     expect(merged["model_providers"]).toBeUndefined();
@@ -140,6 +145,36 @@ describe("provider configuration", () => {
       plugins: true,
       multi_agent_v2: { enabled: true },
     });
+  });
+
+  test("applies the GLM preset without a base_url (injected at runtime)", async () => {
+    expect(resolveScanProvider({ provider: "glm" })).toBe("glm");
+    const merged = await mergedCodexConfig({ provider: "glm" });
+    expect(merged["model"]).toBe("glm-5.3");
+    expect(merged["model_reasoning_effort"]).toBe("high");
+    expect(merged["model_provider"]).toBe("glm");
+    expect(merged["model_providers"]).toEqual({
+      glm: { name: "GLM", wire_api: "responses" },
+    });
+  });
+
+  // The CLI passes --provider via codexOverrides; the preset must apply on
+  // that path as well so --provider glm does not require --model.
+  test("applies the provider presets from codexOverrides alone", async () => {
+    const glm = await mergedCodexConfig({
+      codexOverrides: { model_provider: "glm" },
+    });
+    expect(glm["model"]).toBe("glm-5.3");
+    expect(glm["model_provider"]).toBe("glm");
+    const kimi = await mergedCodexConfig({
+      codexOverrides: { model_provider: "kimi" },
+    });
+    expect(kimi["model"]).toBe("k3-256k");
+    expect(kimi["model_provider"]).toBe("kimi");
+    const openai = await mergedCodexConfig({
+      codexOverrides: { model_provider: "openrouter" },
+    });
+    expect(openai["model"]).toBe("gpt-6-sol");
   });
 
   test("codexOverrides win over the Kimi preset", async () => {
@@ -165,10 +200,11 @@ describe("provider configuration", () => {
     await expect(
       mergedCodexConfig({ provider: "kortex" as "kimi" }),
     ).rejects.toThrow(
-      'Unknown Codex provider: kortex. Expected "openai" or "kimi".',
+      'Unknown Codex provider: kortex. Expected "openai", "kimi", or "glm".',
     );
-    // The frozen preset cannot be mutated by callers.
+    // The frozen presets cannot be mutated by callers.
     expect(Object.isFrozen(KIMI_CODEX_PROVIDER_PRESET)).toBe(true);
+    expect(Object.isFrozen(GLM_CODEX_PROVIDER_PRESET)).toBe(true);
   });
 });
 
@@ -407,8 +443,27 @@ describe("cost estimation for the Kimi model", () => {
     ).toBeNull();
     // OpenAI models keep their pricing.
     expect(
-      estimateScanCost("gpt-5.6-sol", { input_tokens: 0, output_tokens: 0 }),
+      estimateScanCost("gpt-6-sol", { input_tokens: 0, output_tokens: 0 }),
     ).not.toBeNull();
+  });
+});
+
+describe("GLM authentication", () => {
+  test("accepts GLM_API_KEY as sufficient credential for the glm provider", () => {
+    expect(
+      scanAuthentication({ GLM_API_KEY: "synthetic-glm-key" }, "auto", "glm"),
+    ).toEqual({
+      method: "api_key",
+      source: "GLM_API_KEY",
+      verified: false,
+    });
+    expect(scanAuthentication({}, "auto", "glm")).toEqual({
+      method: "stored_credentials",
+      verified: false,
+    });
+    expect(() => scanAuthentication({}, "api-key", "glm")).toThrow(
+      AuthenticationRequiredError,
+    );
   });
 });
 
@@ -429,7 +484,40 @@ describe("CLI --provider", () => {
       }),
     );
     expect(exitCode).toBe(0);
-    expect(config?.["provider"]).toBe("kimi");
+    const codexOverrides = config?.["codexOverrides"] as Record<
+      string,
+      unknown
+    >;
+    expect(codexOverrides["model_provider"]).toBe("kimi");
+    expect(codexOverrides["model_providers"]).toEqual({
+      kimi: { name: "Kimi", wire_api: "responses" },
+    });
+  });
+
+  test("passes --provider glm into the CodexSecurity config", async () => {
+    const stdout = capture();
+    const stderr = capture();
+    let config: Record<string, unknown> | undefined;
+    const exitCode = await cliMain(
+      ["scan", "repo", "--provider", "glm", "--dry-run"],
+      stdout.stream,
+      stderr.stream,
+      dependencies({
+        environment: { GLM_API_KEY: "synthetic-glm-key" },
+        onConfig: (value) => {
+          config = value as Record<string, unknown>;
+        },
+      }),
+    );
+    expect(exitCode).toBe(0);
+    const codexOverrides = config?.["codexOverrides"] as Record<
+      string,
+      unknown
+    >;
+    expect(codexOverrides["model_provider"]).toBe("glm");
+    expect(codexOverrides["model_providers"]).toEqual({
+      glm: { name: "GLM", wire_api: "responses" },
+    });
   });
 
   test("rejects an unknown --provider value", async () => {

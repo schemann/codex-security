@@ -36,8 +36,8 @@ const TestClientBase = CodexSecurity as unknown as new (
   dependencies: Record<string, unknown>,
 ) => CodexSecurity;
 
-function mockScanRegistration(args: readonly string[]) {
-  const recipe = JSON.parse(args[args.indexOf("--recipe-json") + 1]!) as {
+function mockScanRegistration(args: readonly string[], input?: string) {
+  const recipe = JSON.parse(input!).recipe as {
     repositoryRevision?: string;
     target: { kind: string };
   };
@@ -83,6 +83,7 @@ async function* completedEvents(): AsyncGenerator<ThreadEvent> {
     usage: {
       input_tokens: 10,
       cached_input_tokens: 2,
+      cache_write_input_tokens: 0,
       output_tokens: 3,
       reasoning_output_tokens: 1,
     },
@@ -131,11 +132,13 @@ function workbenchMock(
   commands: Array<readonly string[]>,
   overrides: Record<string, (args: readonly string[]) => unknown> = {},
 ) {
-  return async (_options: unknown, args: readonly string[]) => {
+  return async (_options: unknown, args: readonly string[], input?: string) => {
     commands.push(args);
     const command = args[0] ?? "";
     if (overrides[command] !== undefined) return overrides[command](args);
-    if (command === "register-cli-scan") return mockScanRegistration(args);
+    if (command === "register-cli-scan") {
+      return mockScanRegistration(args, input);
+    }
     if (command === "get-scan-feedback") {
       return {
         scanId: "scan_example_001",
@@ -225,6 +228,43 @@ describe("Kimi scan continuation", () => {
     // complete-scan runs exactly once, after the final successful attempt.
     expect(commands.filter((args) => args[0] === "complete-scan").length).toBe(
       1,
+    );
+    await client.close();
+  });
+
+  test("continuation loop also runs for the glm provider", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const codexHome = join(root, "codex-home");
+    await mkdir(repository);
+    await mkdir(codexHome);
+    const commands: Array<readonly string[]> = [];
+    const thread = fakeThread([
+      { events: completedEvents }, // ends "successfully" but writes nothing
+      {
+        events: completedEvents,
+        beforeComplete: async () => {
+          await copyCompletedScan(root);
+        },
+      },
+    ]);
+    const warnings: string[] = [];
+    const client = clientWithThread(
+      root,
+      codexHome,
+      thread,
+      commands,
+      { provider: "glm" },
+      { GLM_API_KEY: "synthetic-glm-key" },
+    );
+
+    const result = await client.run(repository, {
+      onWarning: (warning) => warnings.push(warning),
+    });
+    expect(result).toBeInstanceOf(ScanResult);
+    expect(thread.prompts.length).toBe(2);
+    expect(thread.prompts[1]).toContain(
+      "The Codex Security scan is not complete",
     );
     await client.close();
   });

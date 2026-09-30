@@ -230,6 +230,25 @@ describe("translateRequest reasoning effort", () => {
     expect(body["thinking"]).toBe("high");
     expect(body["reasoning_effort"]).toBeUndefined();
   });
+
+  test("toggle style maps effort onto the Z.ai GLM thinking switch", () => {
+    const enabled = translateRequest(
+      { model: "glm-5.3", input: [], reasoning: { effort: "xhigh" } },
+      { thinkingField: "thinking", thinkingStyle: "toggle" },
+    ).body;
+    expect(enabled["thinking"]).toEqual({ type: "enabled" });
+    const disabled = translateRequest(
+      { model: "glm-5.3", input: [], reasoning: { effort: "low" } },
+      { thinkingField: "thinking", thinkingStyle: "toggle" },
+    ).body;
+    expect(disabled["thinking"]).toEqual({ type: "disabled" });
+    // Ohne Effort-Angabe bleibt der Body unberuehrt (GLM-Denken default an).
+    const untouched = translateRequest(
+      { model: "glm-5.3", input: [] },
+      { thinkingField: "thinking", thinkingStyle: "toggle" },
+    ).body;
+    expect(untouched["thinking"]).toBeUndefined();
+  });
 });
 
 describe("translateRequest tool-call roundtrip items", () => {

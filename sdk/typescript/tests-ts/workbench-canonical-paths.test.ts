@@ -8,7 +8,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { PLUGIN_ROOT } from "./plugin-root.js";
 
@@ -129,6 +129,66 @@ function runPythonProbe(
 }
 
 describe("bundled workbench canonical paths", () => {
+  test("reads Unicode commit subjects regardless of locale or Git log encoding", async () => {
+    const repository = await temporaryDirectory();
+    expect(
+      runPythonProbe(
+        [
+          "import json, subprocess, sys",
+          "from pathlib import Path",
+          "sys.path.insert(0, sys.argv[1])",
+          "import workbench_target as target",
+          "repository = Path(sys.argv[2])",
+          "def git(*args):",
+          "    subprocess.run(['git', '-C', str(repository), *args], check=True, capture_output=True)",
+          "git('init', '-q')",
+          "subjects = [('UTF-8', 'docs: \\u65e5\\u672c\\u8a9e \\ud55c\\uad6d\\uc5b4 \\U0001f527'), ('ISO-8859-1', 'docs: caf\\u00e9')]",
+          "for log_encoding, subject in subjects:",
+          "    git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-qm', subject)",
+          "    git('config', 'i18n.logOutputEncoding', log_encoding)",
+          "    for encoding in ('cp932', 'cp949'):",
+          "        subprocess._text_encoding = lambda: encoding",
+          "        assert target.git_target_metadata(repository)['commitSubject'] == subject",
+          "        assert target.git_bytes(repository, 'show', '-s', '--format=%s', 'HEAD') == (subject + '\\n').encode('utf-8')",
+          "print(json.dumps({'subjects': len(subjects), 'locales': 2}))",
+        ].join("\n"),
+        repository,
+      ),
+    ).toEqual({ subjects: 2, locales: 2 });
+  });
+
+  test("discovers and runs host Git after a batch shim without a host binding", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const shims = join(root, "shims");
+    await mkdir(join(repository, ".git"), { recursive: true });
+    await mkdir(shims);
+    await writeFile(join(shims, "git.cmd"), "@exit /b 99\r\n");
+    await writeFile(join(shims, "git.bat"), "@exit /b 99\r\n");
+    const hostGit = Bun.which("git");
+    expect(hostGit).not.toBeNull();
+    const result = runPythonProbe(
+      [
+        "import json, os, sys",
+        "from pathlib import Path",
+        "sys.path.insert(0, sys.argv[1])",
+        "import workbench_target as target",
+        "os.environ.pop('CODEX_SECURITY_GIT', None)",
+        "os.environ['PATH'] = os.pathsep.join(sys.argv[3:])",
+        "result = target.git_command(Path(sys.argv[2]), '--version', text=True)",
+        "print(json.dumps({'code': result.returncode, 'version': result.stdout, 'command': result.args[0]}))",
+      ].join("\n"),
+      repository,
+      shims,
+      dirname(hostGit!),
+    );
+    expect(result["code"]).toBe(0);
+    expect(result["version"]).toMatch(/^git version /u);
+    expect(result["command"]).toBe(
+      join(await realpath(dirname(hostGit!)), basename(hostGit!)),
+    );
+  });
+
   testPosix(
     "rejects private scan directories under insecure shared parents",
     async () => {

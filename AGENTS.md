@@ -6,10 +6,10 @@ Guidance for agentic coding sessions in this repository.
 
 Fork of [openai/codex-security](https://github.com/openai/codex-security)
 (Apache-2.0). Upstream: CLI + TypeScript SDK (`sdk/typescript`) that drives the
-Codex binary for security scans. Fork addition: a `kimi` provider that runs
-scans against the Kimi Code API (K3 subscription models) through a local
-translation proxy. OpenAI remains the default provider — keep upstream
-behavior unchanged.
+Codex binary for security scans. Fork addition: `kimi` and `glm` providers that
+run scans against subscription APIs (Kimi Code API with K3 models; Z.ai GLM
+API with glm-5.3) through a local translation proxy. OpenAI remains the
+default provider — keep upstream behavior unchanged.
 
 ## Build, lint, test
 
